@@ -3,154 +3,159 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
+	labels "k8s.io/apimachinery/pkg/labels"
 )
 
+// EnvVar names
+const (
+	NamespaceEnvVar     = "NAMESPACE"
+	LabelSelectorEnvVar = "LABEL_SELECTOR"
+	CPULimitEnvVar      = "CPU_LIMIT"
+	MemoryLimitEnvVar   = "MEMORY_LIMIT"
+	CPURequestEnvVar    = "CPU_REQUEST"
+	MemoryRequestEnvVar = "MEMORY_REQUEST"
+)
+
+// Get env var values
 var (
-	runtimeScheme = runtime.NewScheme()
-	codecs        = serializer.NewCodecFactory(runtimeScheme)
-	deserializer  = codecs.UniversalDeserializer()
+	namespace     = os.Getenv(NamespaceEnvVar)
+	labelSelector = os.Getenv(LabelSelectorEnvVar)
+	cpuLimit      = os.Getenv(CPULimitEnvVar)
+	memoryLimit   = os.Getenv(MemoryLimitEnvVar)
+	cpuRequest    = os.Getenv(CPURequestEnvVar)
+	memoryRequest = os.Getenv(MemoryRequestEnvVar)
 )
 
-func main() {
-	http.HandleFunc("/mutate", mutateHandler)
-	server := &http.Server{
-		Addr:    ":8443",
-		Handler: http.DefaultServeMux,
-	}
-
-	fmt.Println("Starting webhook server...")
-	err := server.ListenAndServeTLS("server.crt", "server.key")
+func mutatePod(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		panic(err)
-	}
-}
-
-func mutateHandler(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Error reading request body", http.StatusInternalServerError)
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
 		return
 	}
 
-	var admissionReview admissionv1.AdmissionReview
-	if _, _, err := deserializer.Decode(body, nil, &admissionReview); err != nil {
-		http.Error(w, "Error decoding request", http.StatusBadRequest)
+	// Unmarshal the request
+	admissionReview := admissionv1.AdmissionReview{}
+	err = json.Unmarshal(body, &admissionReview)
+	if err != nil {
+		http.Error(w, "Error unmarshalling request", http.StatusBadRequest)
 		return
 	}
 
-	response := processAdmissionReview(admissionReview)
-	respBytes, err := json.Marshal(response)
+	// Check if the namespace matches
+	if admissionReview.Request.Namespace != namespace {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	pod := corev1.Pod{}
+	err = json.Unmarshal(admissionReview.Request.Object.Raw, &pod)
+	if err != nil {
+		http.Error(w, "Error unmarshalling pod", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the pod labels match the label selector
+	selector, err := metav1.ParseToLabelSelector(labelSelector)
+	if err != nil {
+		http.Error(w, "Error parsing label selector", http.StatusBadRequest)
+		return
+	}
+
+	labelSetSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		http.Error(w, "Error converting label selector to selector", http.StatusBadRequest)
+		return
+	}
+
+	if !labelSetSelector.Matches(labels.Set(pod.Labels)) {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Apply resources limits and requests
+	applyResourceLimitsAndRequests(&pod)
+
+	patchType := admissionv1.PatchTypeJSONPatch
+	admissionResponse := admissionv1.AdmissionResponse{
+		UID:       admissionReview.Request.UID,
+		Allowed:   true,
+		PatchType: &patchType,
+	}
+	admissionReview.Response = &admissionResponse
+
+	responseBody, err := json.Marshal(admissionReview)
 	if err != nil {
 		http.Error(w, "Error marshalling response", http.StatusInternalServerError)
 		return
 	}
-
 	w.WriteHeader(http.StatusOK)
-	w.Write(respBytes)
+	w.Write(responseBody)
 }
 
-func processAdmissionReview(admissionReview admissionv1.AdmissionReview) *admissionv1.AdmissionReview {
-	namespace := os.Getenv("TARGET_NAMESPACE")
-	targetLabelKey := os.Getenv("TARGET_LABEL_KEY")
-	targetLabelValue := os.Getenv("TARGET_LABEL_VALUE")
-	cpuRequest := os.Getenv("CPU_REQUEST")
-	cpuLimit := os.Getenv("CPU_LIMIT")
-	memoryRequest := os.Getenv("MEMORY_REQUEST")
-	memoryLimit := os.Getenv("MEMORY_LIMIT")
-
-	pod := &corev1.Pod{}
-	if err := json.Unmarshal(admissionReview.Request.Object.Raw, pod); err != nil {
-		return &admissionv1.AdmissionReview{
-			Response: &admissionv1.AdmissionResponse{
-				UID:     admissionReview.Request.UID,
-				Allowed: false,
-				Result: &metav1.Status{
-					Message: fmt.Sprintf("Error unmarshalling pod: %v", err),
-				},
-			},
-		}
-	}
-
-	if pod.Namespace != namespace || pod.Labels[targetLabelKey] != targetLabelValue {
-		return &admissionv1.AdmissionReview{
-			Response: &admissionv1.AdmissionResponse{
-				UID:     admissionReview.Request.UID,
-				Allowed: true,
-			},
-		}
-	}
-
-	patch, err := json.Marshal(createPatch(pod, cpuRequest, cpuLimit, memoryRequest, memoryLimit))
-	if err != nil {
-		return &admissionv1.AdmissionReview{
-			Response: &admissionv1.AdmissionResponse{
-				UID:     admissionReview.Request.UID,
-				Allowed: false,
-				Result: &metav1.Status{
-					Message: fmt.Sprintf("Error marshalling patch: %v", err),
-				},
-			},
-		}
-	}
-	return &admissionv1.AdmissionReview{
-		Response: &admissionv1.AdmissionResponse{
-			UID:       admissionReview.Request.UID,
-			Allowed:   true,
-			Patch:     patch,
-			PatchType: func() *admissionv1.PatchType { pt := admissionv1.PatchTypeJSONPatch; return &pt }(),
-		},
-	}
-}
-
-func createPatch(pod *corev1.Pod, cpuRequest, cpuLimit, memoryRequest, memoryLimit string) []map[string]interface{} {
-	var patch []map[string]interface{}
+func applyResourceLimitsAndRequests(pod *corev1.Pod) {
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
-		if container.Resources.Requests == nil {
-			container.Resources.Requests = corev1.ResourceList{}
-		}
+
 		if container.Resources.Limits == nil {
 			container.Resources.Limits = corev1.ResourceList{}
 		}
-
-		if cpuRequest != "" {
-			patch = append(patch, map[string]interface{}{
-				"op":    "add",
-				"path":  fmt.Sprintf("/spec/containers/%d/resources/requests/cpu", i),
-				"value": cpuRequest,
-			})
+		if container.Resources.Requests == nil {
+			container.Resources.Requests = corev1.ResourceList{}
 		}
+		// Apply CPU and memory limits
 		if cpuLimit != "" {
-			patch = append(patch, map[string]interface{}{
-				"op":    "add",
-				"path":  fmt.Sprintf("/spec/containers/%d/resources/limits/cpu", i),
-				"value": cpuLimit,
-			})
+			if _, ok := container.Resources.Limits[corev1.ResourceCPU]; !ok {
+				cpuLimitQuantity, err := strconv.ParseInt(cpuLimit, 10, 64)
+				if err == nil {
+					container.Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(cpuLimitQuantity, resource.DecimalSI)
+				}
+			}
 		}
-		if memoryRequest != "" {
-			patch = append(patch, map[string]interface{}{
-				"op":    "add",
-				"path":  fmt.Sprintf("/spec/containers/%d/resources/requests/memory", i),
-				"value": memoryRequest,
-			})
-		}
+
 		if memoryLimit != "" {
-			patch = append(patch, map[string]interface{}{
-				"op":    "add",
-				"path":  fmt.Sprintf("/spec/containers/%d/resources/limits/memory", i),
-				"value": memoryLimit,
-			})
+			if _, ok := container.Resources.Limits[corev1.ResourceMemory]; !ok {
+				memoryLimitQuantity, err := strconv.ParseInt(memoryLimit, 10, 64)
+				if err == nil {
+					container.Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(memoryLimitQuantity, resource.BinarySI)
+				}
+			}
+		}
+
+		// Apply CPU and memory requests
+		if cpuRequest != "" {
+			if _, ok := container.Resources.Requests[corev1.ResourceCPU]; !ok {
+				cpuRequestQuantity, err := strconv.ParseInt(cpuRequest, 10, 64)
+				if err == nil {
+					container.Resources.Requests[corev1.ResourceCPU] = *resource.NewMilliQuantity(cpuRequestQuantity, resource.DecimalSI)
+				}
+			}
+		}
+
+		if memoryRequest != "" {
+			if _, ok := container.Resources.Requests[corev1.ResourceMemory]; !ok {
+				memoryRequestQuantity, err := strconv.ParseInt(memoryRequest, 10, 64)
+				if err == nil {
+					container.Resources.Requests[corev1.ResourceMemory] = *resource.NewQuantity(memoryRequestQuantity, resource.BinarySI)
+				}
+			}
 		}
 	}
+}
 
-	return patch
+func main() {
+	http.HandleFunc("/mutate-pod", mutatePod)
+	port := "8080"
+	fmt.Printf("Listening on :%s...\n", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		panic(err)
+	}
 }
