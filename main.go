@@ -28,7 +28,7 @@ func main() {
 	}
 
 	fmt.Println("Starting webhook server...")
-	err := server.ListenAndServeTLS("/tls/server.crt", "/tls/server.key")
+	err := server.ListenAndServeTLS("/tls/tls.crt", "/tls/tls.key")
 	if err != nil {
 		panic(err)
 	}
