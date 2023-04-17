@@ -1,25 +1,21 @@
 apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
+kind: MutatingWebhookConfiguration
 metadata:
- name: my-webhook-configuration
+  name: webhook-server
 webhooks:
-
-name: my-webhook.my-namespace.svc
-sideEffects: None
-admissionReviewVersions: ["v1"]
-rules:
-apiGroups: [""]
-apiVersions: ["v1"]
-operations: ["CREATE", "UPDATE"]
-resources: ["pods"]
-scope: "Namespaced"
-clientConfig:
-service:
-namespace: my-namespace
-name: my-webhook
-path: "/mutate"
-caBundle: ${CABUNDLE}
-
+  - name: webhook.example.com
+    matchPolicy: Equivalent
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      caBundle: <base64-encoded server.crt content>
+      url: "https://<your-webhook-domain-or-ip>:8443/mutate"
 
 #使用以下命令将生成的 `webhook-crt.pem` 证书的内容注入到 `caBundle` 字段中：
 
