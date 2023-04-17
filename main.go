@@ -155,7 +155,7 @@ func main() {
 	http.HandleFunc("/mutate-pod", mutatePod)
 	port := "8080"
 	fmt.Printf("Listening on :%s...\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := http.ListenAndServeTLS(":"+port, "/tls/tls.crt", "/tls/tls.key", nil); err != nil {
 		panic(err)
 	}
 }
